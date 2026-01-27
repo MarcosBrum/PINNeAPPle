@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Hashable, Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence, Tuple, Hashable
+from typing import Any
 
 import torch
 
-from .zarr_store import UPDZarrStore
 from .cache_bytes import ByteLRUCache
+from .zarr_store import UPDZarrStore
 
 
-def _norm_keys(keys: Optional[Sequence[str]]) -> Tuple[str, ...]:
+def _norm_keys(keys: Sequence[str] | None) -> tuple[str, ...]:
     if keys is None:
         return tuple()
     return tuple(sorted([str(k) for k in keys]))
@@ -17,8 +18,8 @@ def _norm_keys(keys: Optional[Sequence[str]]) -> Tuple[str, ...]:
 
 @dataclass
 class ZarrByteCacheConfig:
-    max_sample_bytes: int = 512 * 1024 * 1024   # full-sample cache budget
-    max_field_bytes: int = 512 * 1024 * 1024    # field-level cache budget
+    max_sample_bytes: int = 512 * 1024 * 1024  # full-sample cache budget
+    max_field_bytes: int = 512 * 1024 * 1024  # field-level cache budget
     enable_field_cache: bool = True
 
 
@@ -26,7 +27,10 @@ class CachedUPDZarrStoreBytes:
     """
     Cached wrapper around UPDZarrStore using ByteLRUCache.
     """
-    def __init__(self, root: str, *, cache: Optional[ZarrByteCacheConfig] = None, mode: str = "r"):
+
+    def __init__(
+        self, root: str, *, cache: ZarrByteCacheConfig | None = None, mode: str = "r"
+    ):
         self.store = UPDZarrStore(root, mode=mode)
         self.cache_cfg = cache or ZarrByteCacheConfig()
 
@@ -34,18 +38,18 @@ class CachedUPDZarrStoreBytes:
         self.field_cache = ByteLRUCache(max_bytes=self.cache_cfg.max_field_bytes)
 
     def count(self) -> int:
-        return self.store.count()
+        return self.store.num_samples()
 
-    def manifest(self) -> Dict[str, Any]:
+    def manifest(self) -> dict[str, Any]:
         return self.store.manifest()
 
     def _sample_key(
         self,
         i: int,
-        fields: Optional[Sequence[str]],
-        coords: Optional[Sequence[str]],
+        fields: Sequence[str] | None,
+        coords: Sequence[str] | None,
         device: str | torch.device,
-        dtype: Optional[torch.dtype],
+        dtype: torch.dtype | None,
     ) -> Hashable:
         dev = str(device)
         dt = str(dtype) if dtype is not None else ""
@@ -57,7 +61,7 @@ class CachedUPDZarrStoreBytes:
         kind: str,
         name: str,
         device: str | torch.device,
-        dtype: Optional[torch.dtype],
+        dtype: torch.dtype | None,
     ) -> Hashable:
         dev = str(device)
         dt = str(dtype) if dtype is not None else ""
@@ -67,10 +71,10 @@ class CachedUPDZarrStoreBytes:
         self,
         i: int,
         *,
-        fields: Optional[Sequence[str]] = None,
-        coords: Optional[Sequence[str]] = None,
+        fields: Sequence[str] | None = None,
+        coords: Sequence[str] | None = None,
         device: str | torch.device = "cpu",
-        dtype: Optional[torch.dtype] = None,
+        dtype: torch.dtype | None = None,
         sample_ctor=None,
         use_sample_cache: bool = True,
     ):
@@ -81,20 +85,25 @@ class CachedUPDZarrStoreBytes:
                 return cached
 
         if self.cache_cfg.enable_field_cache:
-            fk = self.store.field_keys()
-            ck = self.store.coord_keys()
+            fk = self.store.field_names()
+            ck = self.store.domain_names()
             req_fields = list(fields) if fields is not None else fk
             req_coords = list(coords) if coords is not None else ck
 
-            out_fields: Dict[str, torch.Tensor] = {}
-            out_coords: Dict[str, torch.Tensor] = {}
+            out_fields: dict[str, torch.Tensor] = {}
+            out_coords: dict[str, torch.Tensor] = {}
 
             for name in req_fields:
                 k = self._field_key(i, "field", name, device, dtype)
                 v = self.field_cache.get(k)
                 if v is None:
                     fdict, _meta = self.store.read_sample(
-                        i, fields=[name], coords=[], device=device, dtype=dtype, sample_ctor=lambda f, c, m: (f, m)
+                        i,
+                        fields=[name],
+                        coords=[],
+                        device=device,
+                        dtype=dtype,
+                        sample_ctor=lambda f, c, m: (f, m),
                     )
                     if name in fdict:
                         v = fdict[name]
@@ -107,7 +116,12 @@ class CachedUPDZarrStoreBytes:
                 v = self.field_cache.get(k)
                 if v is None:
                     cdict, _meta = self.store.read_sample(
-                        i, fields=[], coords=[name], device=device, dtype=dtype, sample_ctor=lambda f, c, m: (c, m)
+                        i,
+                        fields=[],
+                        coords=[name],
+                        device=device,
+                        dtype=dtype,
+                        sample_ctor=lambda f, c, m: (c, m),
                     )
                     if name in cdict:
                         v = cdict[name]
@@ -119,7 +133,10 @@ class CachedUPDZarrStoreBytes:
             if sample_ctor is None:
                 try:
                     from .physical_sample import PhysicalSample
-                    sample = PhysicalSample(fields=out_fields, coords=out_coords, meta=meta)
+
+                    sample = PhysicalSample(
+                        fields=out_fields, coords=out_coords, meta=meta
+                    )
                 except Exception:
                     sample = {"fields": out_fields, "coords": out_coords, "meta": meta}
             else:
@@ -129,12 +146,19 @@ class CachedUPDZarrStoreBytes:
                 self.sample_cache.put(sk, sample)
             return sample
 
-        sample = self.store.read_sample(i, fields=fields, coords=coords, device=device, dtype=dtype, sample_ctor=sample_ctor)
+        sample = self.store.read_sample(
+            i,
+            fields=fields,
+            coords=coords,
+            device=device,
+            dtype=dtype,
+            sample_ctor=sample_ctor,
+        )
         if use_sample_cache:
             self.sample_cache.put(sk, sample)
         return sample
 
-    def cache_stats(self) -> Dict[str, Any]:
+    def cache_stats(self) -> dict[str, Any]:
         return {
             "sample_cache": {
                 "items": len(self.sample_cache),

@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
-import json
+from collections.abc import Callable
 from dataclasses import asdict
-from typing import Dict, Any, List
+from typing import Any
 
 import torch
 
 from benchmarks._latency import latency_summary
-
-from pinneaple_data import PhysicalSample
-from pinneaple_data import UPDZarrStore
-from pinneaple_data import PrefetchZarrUPDIterable, PrefetchConfig
-from pinneaple_data import CachedUPDZarrStoreBytes, ZarrByteCacheConfig
+from pinneaple_data import (
+    CachedUPDZarrStoreBytes,
+    PhysicalSample,
+    PrefetchConfig,
+    PrefetchZarrUPDIterable,
+    UPDZarrStore,
+    ZarrByteCacheConfig,
+)
 
 try:
     import psutil
@@ -29,10 +33,25 @@ def sys_mem_mb() -> float:
     return p.memory_info().rss / (1024 * 1024)
 
 
-def cuda_mem_mb() -> float:
-    if not torch.cuda.is_available():
+def select_device(device: str) -> str:
+    """
+    Select device following user choice and system availability.
+    """
+    if device == "cuda" and torch.cuda.is_available():
+        return "cuda"
+    elif device == "mps" and torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
+
+def current_gpu_usage_mb(device: str) -> float:
+    if device == "cuda":
+        return torch.cuda.max_memory_allocated() / (1024 * 1024)
+    elif device == "mps":
+        return torch.mps.current_allocated_memory() / (1024 * 1024)
+    else:
         return 0.0
-    return torch.cuda.max_memory_allocated() / (1024 * 1024)
 
 
 def make_dataset(zarr_root: str, n: int, shape_t: int, shape_x: int) -> None:
@@ -45,50 +64,69 @@ def make_dataset(zarr_root: str, n: int, shape_t: int, shape_x: int) -> None:
         u = torch.randn(shape_t, shape_x)
         samples.append(
             PhysicalSample(
-                fields={"u": u},
-                coords={},
-                meta={"ids": {"sample_id": f"s{i:06d}"}},
+                state={"u": u},
+                domain={},
+                provenance={},
+                schema={},
+                extras={"ids": {"sample_id": f"s{i:06d}"}},
             )
         )
-    UPDZarrStore.write(zarr_root, samples, manifest={"bench": "data_io_bench", "count": n})
-    print(f"[OK] Wrote Zarr dataset at {zarr_root} with {n} samples, u.shape=({shape_t},{shape_x})")
+    UPDZarrStore.write(
+        zarr_root, samples, manifest={"bench": "data_io_bench", "count": n}
+    )
+    print(
+        f"[OK] Wrote Zarr dataset at {zarr_root} with {n} samples, u.shape=({shape_t},{shape_x})"
+    )
 
 
 def _dtype(dtype: str) -> torch.dtype:
     return torch.float32 if dtype == "fp32" else torch.float16
 
 
-def bench_plain_read(zarr_root: str, steps: int, device: str, dtype: str, latency_max: int) -> Dict[str, Any]:
+def gpu_monitor_decorator(
+    bench_function: Callable[..., dict[str, str | int | float]], **kwargs
+) -> Callable[..., dict[str, str | int | float]]:
+
+    def wrapper(**kwargs):
+        device = kwargs.get("device", "cpu")
+        initial_gpu_usage = current_gpu_usage_mb(device)
+
+        result = bench_function(**kwargs)
+        result[f"{device}_peak_mb"] = current_gpu_usage_mb(device) - initial_gpu_usage
+        return result
+
+    return wrapper
+
+
+@gpu_monitor_decorator
+def bench_plain_read(
+    zarr_root: str, steps: int, device: str, dtype: str, latency_max: int
+) -> dict[str, Any]:
+
     store = UPDZarrStore(zarr_root, mode="r")
-    n = store.count()
-    dt = _dtype(dtype)
+    n = store.num_samples()
 
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-
-    lat: List[float] = []
+    lat: list[float] = []
     t0 = time.perf_counter()
     checksum = 0.0
     count = 0
 
     for i in range(min(steps, n)):
         t1 = time.perf_counter()
-        s = store.read_sample(i, fields=["u"], coords=[], device="cpu", dtype=dt)
-        u = s.fields["u"]
+        s = store.read_sample(i, fields=["u"])
+        u = s.state["u"]
 
-        if device == "cuda":
-            u = u.pin_memory().to("cuda", non_blocking=True)
-            checksum += float(u.mean().item())
-        else:
-            checksum += float(u.mean().item())
+        checksum += float(u.mean().item())
 
         t2 = time.perf_counter()
         if len(lat) < latency_max:
             lat.append((t2 - t1) * 1000.0)
         count += 1
 
-    if torch.cuda.is_available():
+    if device == "cuda":
         torch.cuda.synchronize()
+    elif device == "mps":
+        torch.mps.synchronize()
 
     dt_s = time.perf_counter() - t0
     return {
@@ -98,12 +136,14 @@ def bench_plain_read(zarr_root: str, steps: int, device: str, dtype: str, latenc
         "samples_per_s": count / max(dt_s, 1e-9),
         "latency": latency_summary(lat),
         "sys_mem_mb": sys_mem_mb(),
-        "cuda_peak_mb": cuda_mem_mb(),
         "checksum": checksum,
     }
 
 
-def bench_cached_store_bytes(zarr_root: str, steps: int, device: str, dtype: str, max_mb: int, latency_max: int) -> Dict[str, Any]:
+@gpu_monitor_decorator
+def bench_cached_store_bytes(
+    zarr_root: str, steps: int, device: str, dtype: str, max_mb: int, latency_max: int
+) -> dict[str, Any]:
     cache_cfg = ZarrByteCacheConfig(
         max_sample_bytes=max_mb * 1024 * 1024,
         max_field_bytes=max_mb * 1024 * 1024,
@@ -112,36 +152,30 @@ def bench_cached_store_bytes(zarr_root: str, steps: int, device: str, dtype: str
     store = CachedUPDZarrStoreBytes(zarr_root, cache=cache_cfg, mode="r")
 
     n = store.count()
-    dt = _dtype(dtype)
 
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-
-    lat: List[float] = []
+    lat: list[float] = []
     t0 = time.perf_counter()
     checksum = 0.0
     count = 0
 
     # two passes to show cache warmth
-    for pass_id in range(2):
+    for _ in range(2):
         for i in range(min(steps, n)):
             t1 = time.perf_counter()
-            s = store.read_sample(i, fields=["u"], coords=[], device="cpu", dtype=dt)
-            u = s.fields["u"]
+            s = store.read_sample(i, fields=["u"])
+            u = s.state["u"]
 
-            if device == "cuda":
-                u = u.pin_memory().to("cuda", non_blocking=True)
-                checksum += float(u.mean().item())
-            else:
-                checksum += float(u.mean().item())
+            checksum += float(u.mean().item())
 
             t2 = time.perf_counter()
             if len(lat) < latency_max:
                 lat.append((t2 - t1) * 1000.0)
             count += 1
 
-    if torch.cuda.is_available():
+    if device == "cuda":
         torch.cuda.synchronize()
+    elif device == "mps":
+        torch.mps.synchronize()
 
     dt_s = time.perf_counter() - t0
     stats = store.cache_stats()
@@ -152,26 +186,31 @@ def bench_cached_store_bytes(zarr_root: str, steps: int, device: str, dtype: str
         "samples_per_s": count / max(dt_s, 1e-9),
         "latency": latency_summary(lat),
         "sys_mem_mb": sys_mem_mb(),
-        "cuda_peak_mb": cuda_mem_mb(),
         "checksum": checksum,
         "cache_stats": stats,
     }
 
 
-def bench_prefetch_iterable(zarr_root: str, steps: int, device: str, dtype: str, num_workers: int, pin: bool, latency_max: int) -> Dict[str, Any]:
+@gpu_monitor_decorator
+def bench_prefetch_iterable(
+    zarr_root: str,
+    steps: int,
+    device: str,
+    dtype: str,
+    num_workers: int,
+    pin: bool,
+    latency_max: int,
+) -> dict[str, Any]:
     from torch.utils.data import DataLoader
 
     dt = _dtype(dtype)
-
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
 
     prefetch_cfg = PrefetchConfig(
         prefetch=16,
         queue_max=32,
         use_sample_cache=True,
         pin_memory=pin,
-        target_device=("cuda" if device == "cuda" else "cpu"),
+        target_device=device,
         transfer_non_blocking=True,
     )
 
@@ -187,9 +226,14 @@ def bench_prefetch_iterable(zarr_root: str, steps: int, device: str, dtype: str,
         ),
         prefetch_cfg=prefetch_cfg,
     )
-    dl = DataLoader(ds, batch_size=None, num_workers=num_workers, persistent_workers=(num_workers > 0))
+    dl = DataLoader(
+        ds,
+        batch_size=None,
+        num_workers=num_workers,
+        persistent_workers=(num_workers > 0),
+    )
 
-    lat: List[float] = []
+    lat: list[float] = []
     t0 = time.perf_counter()
     checksum = 0.0
     count = 0
@@ -205,8 +249,10 @@ def bench_prefetch_iterable(zarr_root: str, steps: int, device: str, dtype: str,
             lat.append((t2 - t1) * 1000.0)
         count += 1
 
-    if torch.cuda.is_available():
+    if device == "cuda":
         torch.cuda.synchronize()
+    elif device == "mps":
+        torch.mps.synchronize()
 
     dt_s = time.perf_counter() - t0
     return {
@@ -216,7 +262,6 @@ def bench_prefetch_iterable(zarr_root: str, steps: int, device: str, dtype: str,
         "samples_per_s": count / max(dt_s, 1e-9),
         "latency": latency_summary(lat),
         "sys_mem_mb": sys_mem_mb(),
-        "cuda_peak_mb": cuda_mem_mb(),
         "checksum": checksum,
         "config": asdict(prefetch_cfg),
         "num_workers": num_workers,
@@ -232,21 +277,56 @@ def main():
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--T", type=int, default=1024)
     ap.add_argument("--X", type=int, default=256)
-    ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+    ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda", "mps"])
     ap.add_argument("--dtype", type=str, default="fp32", choices=["fp32", "fp16"])
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--cache_mb", type=int, default=512)
-    ap.add_argument("--latency_max", type=int, default=2000, help="max samples to store for latency percentiles")
+    ap.add_argument(
+        "--latency_max",
+        type=int,
+        default=2000,
+        help="max samples to store for latency percentiles",
+    )
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     make_dataset(args.zarr, args.n, args.T, args.X)
 
+    # select device based on user choice and system availability
+    device = select_device(args.device)
+
     results = []
-    results.append(bench_plain_read(args.zarr, args.steps, args.device, args.dtype, args.latency_max))
-    results.append(bench_cached_store_bytes(args.zarr, args.steps, args.device, args.dtype, args.cache_mb, args.latency_max))
-    results.append(bench_prefetch_iterable(args.zarr, args.steps, args.device, args.dtype, args.workers, pin=True, latency_max=args.latency_max))
-    results.append(bench_prefetch_iterable(args.zarr, args.steps, args.device, args.dtype, args.workers, pin=False, latency_max=args.latency_max))
+    results.append(
+        bench_plain_read(
+            zarr_root=args.zarr,
+            steps=args.steps,
+            device=device,
+            dtype=args.dtype,
+            latency_max=args.latency_max,
+        )
+    )
+    results.append(
+        bench_cached_store_bytes(
+            zarr_root=args.zarr,
+            steps=args.steps,
+            device=device,
+            dtype=args.dtype,
+            max_mb=args.cache_mb,
+            latency_max=args.latency_max,
+        )
+    )
+    for pin in [True, False]:
+        results.append(
+            bench_prefetch_iterable(
+                zarr_root=args.zarr,
+                steps=args.steps,
+                device=device,
+                dtype=args.dtype,
+                num_workers=args.workers,
+                pin=pin,
+                latency_max=args.latency_max,
+            )
+        )
 
     out_json = os.path.join(args.out, "results.json")
     with open(out_json, "w", encoding="utf-8") as f:
@@ -255,7 +335,8 @@ def main():
                 "env": {
                     "torch": torch.__version__,
                     "cuda_available": torch.cuda.is_available(),
-                    "device": args.device,
+                    "mps_available": torch.backends.mps.is_available(),
+                    "device": device,
                     "dtype": args.dtype,
                 },
                 "args": vars(args),

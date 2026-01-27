@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union, Iterable, Mapping
+from typing import Any
 
 import xarray as xr
 
@@ -18,12 +19,13 @@ class PhysicalSample:
     - provenance: lineage (uid, source, query, tiling, time span, etc.)
     - extras: extensibility (feature caches, mesh labels, sdf, etc.)
     """
-    state: Union[xr.Dataset, Dict[str, Any]]
-    geometry: Optional[Any] = None
-    schema: Dict[str, Any] = field(default_factory=dict)
-    domain: Dict[str, Any] = field(default_factory=dict)
-    provenance: Dict[str, Any] = field(default_factory=dict)
-    extras: Dict[str, Any] = field(default_factory=dict)
+
+    state: xr.Dataset | Mapping[str, Any]
+    geometry: Any | None = None
+    schema: Mapping[str, Any] = field(default_factory=dict)
+    domain: Mapping[str, Any] = field(default_factory=dict)
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+    extras: Mapping[str, Any] = field(default_factory=dict)
 
     # -------------------------
     # Domain helpers
@@ -54,7 +56,7 @@ class PhysicalSample:
             return [str(k) for k in self.state.keys()]
         return []
 
-    def summary(self) -> Dict[str, Any]:
+    def summary(self) -> dict[str, Any]:
         out = {
             "domain_type": self.domain_type(),
             "has_geometry": self.geometry is not None,
@@ -69,7 +71,10 @@ class PhysicalSample:
                 "vars": list(self.state.data_vars),
             }
         else:
-            out["state"] = {"type": type(self.state).__name__, "vars": self.list_variables()}
+            out["state"] = {
+                "type": type(self.state).__name__,
+                "vars": self.list_variables(),
+            }
         return out
 
     # -------------------------
@@ -79,10 +84,10 @@ class PhysicalSample:
         self,
         *,
         x_vars: Iterable[str],
-        y_vars: Optional[Iterable[str]] = None,
-        coords: Optional[Iterable[str]] = None,
-        time_dim: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        y_vars: Iterable[str] | None = None,
+        coords: Iterable[str] | None = None,
+        time_dim: str | None = None,
+    ) -> dict[str, Any]:
         """
         Converts this sample into a canonical training dict:
           {"x": <tensor>, "y": <tensor?>, "coords": {...}, "meta": {...}}
@@ -105,14 +110,17 @@ class PhysicalSample:
                 arrs.append(da.data)  # numpy-like
             # stack on last dim
             import numpy as np
+
             return np.stack(arrs, axis=-1)
 
-        def _stack_from_dict(d: Dict[str, Any], vars_: list[str]):
+        def _stack_from_dict(d: dict[str, Any], vars_: list[str]):
             import numpy as np
+
             arrs = [d[v] for v in vars_]
             # if tensors, torch.stack works; if numpy, np.stack works
             if hasattr(arrs[0], "shape") and "torch" in str(type(arrs[0])):
                 import torch
+
                 return torch.stack(arrs, dim=-1)
             return np.stack(arrs, axis=-1)
 
