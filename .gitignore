@@ -2,11 +2,14 @@
 __pycache__/
 *.DS_Store
 *.vscode
+.idea
+
+# Directories with benchmark results
+bench_out/
+examples/_out/
 
 # Python Environments
 .env
 .venv
 /env
-
-# Others
-bench_out
+.pytest_cache/
